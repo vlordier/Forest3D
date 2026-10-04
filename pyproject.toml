@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Terrain generation and environmental modeling toolkit for Gazebo robotics simulation"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 authors = [
     {name = "AI4Forest", email = "khalid.bourr@gmail.com"}
 ]
@@ -19,11 +19,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: GIS",
     "Topic :: Scientific/Engineering :: Visualization",
 ]
@@ -35,7 +34,7 @@ dependencies = [
     "PyYAML>=6.0",
     "click>=8.0.0",
     "rich>=12.0.0",
-    "pydantic>=2.0.0",
+    "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +44,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=3.0.0",
     "mypy>=1.0.0",
+]
+terrain = [
+    "gdal>=3.6",
 ]
 
 [project.scripts]
@@ -56,6 +58,12 @@ Documentation = "https://github.com/khalidbourr/Forest3D#readme"
 Repository = "https://github.com/khalidbourr/Forest3D.git"
 Issues = "https://github.com/khalidbourr/Forest3D/issues"
 
+[tool.uv]
+package = true
+
+[tool.uv.workspace]
+members = ["."]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -64,7 +72,7 @@ forest3d = ["py.typed"]
 
 [tool.black]
 line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+target-version = ['py311', 'py312', 'py313', 'py314']
 
 [tool.pylint.messages_control]
 disable = ["C0114", "C0115", "C0116"]
@@ -75,7 +83,12 @@ python_files = "test_*.py"
 addopts = "-v --cov=forest3d --cov-report=term-missing"
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "pillow>=12.3.0",
+]
