@@ -3,8 +3,10 @@
 import click
 from pathlib import Path
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from pydantic import ValidationError
 
-from forest3d.config.loader import load_config
+from forest3d.cli.config import load_cli_config, resolve_project_paths
+from forest3d.config.schema import TerrainConfig
 
 # Default output location
 DEFAULT_OUTPUT = "./models/ground"
@@ -12,37 +14,44 @@ DEFAULT_OUTPUT = "./models/ground"
 
 @click.command()
 @click.option(
-    "--dem", "-d", "dem_path", type=click.Path(exists=True), required=True,
-    help="Path to DEM file (GeoTIFF), typically in ./DEM/ folder"
+    "--dem",
+    "-d",
+    "dem_path",
+    type=click.Path(exists=True),
+    required=True,
+    help="Path to DEM file (GeoTIFF), typically in ./DEM/ folder",
 )
 @click.option(
-    "--output", "-o", "output_path", type=click.Path(), default=DEFAULT_OUTPUT,
-    help=f"Output directory for generated terrain (default: {DEFAULT_OUTPUT})"
+    "--output",
+    "-o",
+    "output_path",
+    type=click.Path(),
+    default=DEFAULT_OUTPUT,
+    help=f"Output directory for generated terrain (default: {DEFAULT_OUTPUT})",
 )
 @click.option(
-    "--scale", "-s", type=float, default=None,
-    help="Scale factor for terrain (default: 1.0)"
+    "--scale", "-s", type=float, default=None, help="Scale factor for terrain (default: 1.0)"
+)
+@click.option("--smooth", type=float, default=None, help="Gaussian smoothing sigma (default: 1.0)")
+@click.option("--enhance/--no-enhance", default=None, help="Enable DEM resolution enhancement")
+@click.option(
+    "--texture",
+    "-t",
+    "texture_path",
+    type=click.Path(exists=True),
+    help="Path to Blender file (.blend) for terrain texture, typically in ./Blender-Assets/soil/",
 )
 @click.option(
-    "--smooth", type=float, default=None,
-    help="Gaussian smoothing sigma (default: 1.0)"
-)
-@click.option(
-    "--enhance/--no-enhance", default=None,
-    help="Enable DEM resolution enhancement"
-)
-@click.option(
-    "--texture", "-t", "texture_path", type=click.Path(exists=True),
-    help="Path to Blender file (.blend) for terrain texture, typically in ./Blender-Assets/soil/"
-)
-@click.option(
-    "--blender", "blender_path", type=click.Path(exists=True),
-    help="Path to Blender executable (auto-detected if not specified)"
+    "--blender",
+    "blender_path",
+    type=click.Path(exists=True),
+    help="Path to Blender executable (auto-detected if not specified)",
 )
 
 # Advanced options (uncomment to enable):
 # @click.option("--z-scale", type=float, default=None, help="Z scale factor for elevation")
 # @click.option("--uv-tile", "-u", type=float, default=10.0, help="UV tile scale - texture repetition")
+
 
 @click.pass_context
 def terrain(ctx, dem_path, output_path, scale, smooth, enhance, texture_path, blender_path):
@@ -89,19 +98,28 @@ def terrain(ctx, dem_path, output_path, scale, smooth, enhance, texture_path, bl
     """
     console = ctx.obj["console"]
     logger = ctx.obj["logger"]
-    config = load_config(ctx.obj.get("config_path"))
+    config = load_cli_config(ctx.obj.get("config_path"))
+    paths = resolve_project_paths(config)
+    output_path = Path(output_path).expanduser().resolve() if output_path != DEFAULT_OUTPUT else paths.models / "ground"
+    dem_path = Path(dem_path).resolve()
 
     # Override config with CLI options
-    if scale is not None:
-        config.terrain.scale_factor = scale
-    if smooth is not None:
-        config.terrain.smooth_sigma = smooth
-    if enhance is not None:
-        config.terrain.enhance = enhance
-    if texture_path is not None:
-        config.terrain.texture_blend = Path(texture_path)
-    if blender_path is not None:
-        config.blender.path = Path(blender_path)
+    try:
+        terrain_values = config.terrain.model_dump()
+        if scale is not None:
+            terrain_values["scale_factor"] = scale
+        if smooth is not None:
+            terrain_values["smooth_sigma"] = smooth
+        if enhance is not None:
+            terrain_values["enhance"] = enhance
+        if texture_path is not None:
+            terrain_values["texture_blend"] = Path(texture_path)
+        config.terrain = TerrainConfig.model_validate(terrain_values)
+
+        if blender_path is not None:
+            config.blender.path = Path(blender_path)
+    except ValidationError as exc:
+        raise click.ClickException(f"Invalid terrain configuration:\n{exc}") from exc
 
     # Show configuration
     console.print(f"[bold]Terrain Generation[/bold]")
@@ -133,7 +151,7 @@ def terrain(ctx, dem_path, output_path, scale, smooth, enhance, texture_path, bl
 
             generator = TerrainGenerator(
                 tif_path=Path(dem_path),
-                output_path=Path(output_path) if output_path else None,
+                output_path=output_path,
                 config=config.terrain,
                 blender_path=config.blender.path,
             )

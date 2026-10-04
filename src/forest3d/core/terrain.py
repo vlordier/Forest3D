@@ -1,6 +1,7 @@
 """Terrain generation from DEM data."""
 
 import logging
+import json
 import os
 import shutil
 import subprocess
@@ -16,11 +17,79 @@ from forest3d.config.schema import TerrainConfig
 
 try:
     from osgeo import gdal
+    from osgeo import osr
+
     GDAL_AVAILABLE = True
 except ImportError:
     GDAL_AVAILABLE = False
 
 logger = logging.getLogger("forest3d.terrain")
+
+
+def _metric_coordinate_transform(spatial_ref, geotransform, cols: int, rows: int):
+    """Return a coordinate transform to meters, using local AEQD for geographic DEMs."""
+    if spatial_ref is None:
+        raise ValueError("DEM is missing its CRS; assign or reproject it to a known CRS")
+    source = spatial_ref.Clone()
+    source.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    if source.IsProjected():
+        factor = source.GetLinearUnits()
+        if not np.isfinite(factor) or factor <= 0:
+            raise ValueError("DEM CRS has invalid linear units")
+        return lambda x, y: (x * factor, y * factor), source, factor
+    if not source.IsGeographic():
+        raise ValueError("DEM CRS must be geographic or projected with linear units")
+
+    # Project around the raster center to keep local horizontal distances in meters.
+    center_col, center_row = (cols - 1) / 2, (rows - 1) / 2
+    origin_x, pixel_x, rotation_x, origin_y, rotation_y, pixel_y = geotransform
+    center_lon = origin_x + center_col * pixel_x + center_row * rotation_x
+    center_lat = origin_y + center_col * rotation_y + center_row * pixel_y
+    target = osr.SpatialReference()
+    target.SetWellKnownGeogCS("WGS84")
+    target.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+    target.SetProjCS("Forest3D local azimuthal equidistant")
+    target.SetAE(center_lat, center_lon, 0.0, 0.0)
+    target.SetLinearUnits("metre", 1.0)
+    transform = osr.CoordinateTransformation(source, target)
+
+    def project(x, y):
+        point = transform.TransformPoint(x, y)
+        return point[0], point[1]
+
+    return project, target, 1.0
+
+
+def _read_valid_elevation(dataset) -> np.ndarray:
+    """Read band one applying mask, NoData, scale, and offset; reject holes."""
+    band = dataset.GetRasterBand(1)
+    values = band.ReadAsArray()
+    if values is None:
+        raise ValueError("DEM band 1 could not be read")
+    valid = np.isfinite(values)
+    mask_band = band.GetMaskBand()
+    if mask_band is not None:
+        valid &= mask_band.ReadAsArray() != 0
+    nodata = band.GetNoDataValue()
+    if nodata is not None:
+        if np.isnan(nodata):
+            valid &= ~np.isnan(values)
+        else:
+            valid &= values != nodata
+    if not np.all(valid):
+        raise ValueError(
+            "DEM contains NoData or masked cells; fill or crop invalid cells before terrain generation"
+        )
+    scale = band.GetScale()
+    offset = band.GetOffset()
+    elevation = values.astype(np.float64)
+    if scale is not None:
+        elevation *= scale
+    if offset is not None:
+        elevation += offset
+    if not np.isfinite(elevation).all():
+        raise ValueError("DEM elevations contain non-finite values after scale and offset")
+    return elevation.astype(np.float32)
 
 
 def find_blender() -> Optional[Path]:
@@ -35,7 +104,7 @@ def find_blender() -> Optional[Path]:
         Path("/snap/bin/blender"),
         Path("/opt/blender/blender"),
         Path.home() / "blender" / "blender",
-        ]
+    ]
 
     for base in [Path.home() / "Downloads", Path("/opt"), Path.home()]:
         if base.exists():
@@ -63,11 +132,11 @@ class TerrainGenerator:
     """
 
     def __init__(
-            self,
-            tif_path: Path,
-            output_path: Optional[Path] = None,
-            config: Optional[TerrainConfig] = None,
-            blender_path: Optional[Path] = None,
+        self,
+        tif_path: Path,
+        output_path: Optional[Path] = None,
+        config: Optional[TerrainConfig] = None,
+        blender_path: Optional[Path] = None,
     ):
         if not GDAL_AVAILABLE:
             raise ImportError("GDAL is required. Install with: pip install GDAL")
@@ -112,12 +181,12 @@ class TerrainGenerator:
         return output_tiff
 
     def create_terrain_mesh(
-            self,
-            scale_factor: Optional[float] = None,
-            z_scale: Optional[float] = None,
-            smooth_sigma: Optional[float] = None,
-            enhance: Optional[bool] = None,
-            uv_tile_scale: float = 10.0,
+        self,
+        scale_factor: Optional[float] = None,
+        z_scale: Optional[float] = None,
+        smooth_sigma: Optional[float] = None,
+        enhance: Optional[bool] = None,
+        uv_tile_scale: float = 10.0,
     ) -> Tuple[Path, dict]:
         """Create terrain meshes (OBJ for visual, STL for collision/height sampling)."""
         scale_factor = scale_factor if scale_factor is not None else self.config.scale_factor
@@ -136,9 +205,13 @@ class TerrainGenerator:
             raise RuntimeError(f"Failed to open {dem_file}")
 
         geotransform = ds.GetGeoTransform()
-        pixel_width = abs(geotransform[1])
-        pixel_height = abs(geotransform[5])
-        elevation = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+        if geotransform is None:
+            raise ValueError("DEM is missing its affine geotransform")
+        if not np.isclose(geotransform[2], 0.0) or not np.isclose(geotransform[4], 0.0):
+            raise ValueError(
+                "Rotated or skewed DEM affine transforms are unsupported; reproject/resample to north-up"
+            )
+        elevation = _read_valid_elevation(ds)
 
         if smooth_sigma > 0:
             elevation = gaussian_filter(elevation, sigma=smooth_sigma)
@@ -146,13 +219,20 @@ class TerrainGenerator:
         rows, cols = elevation.shape
         logger.info(f"Creating mesh from {rows}x{cols} DEM...")
 
-        # Generate vertices, UVs, faces
+        coordinate_transform, world_srs, unit_factor = _metric_coordinate_transform(
+            ds.GetSpatialRef(), geotransform, cols, rows
+        )
+
+        # Generate vertices in a local metric coordinate system, preserving raster orientation.
         vertices = []
         uvs = []
         for y in range(rows):
             for x in range(cols):
-                world_x = x * pixel_width * scale_factor
-                world_y = y * pixel_height * scale_factor
+                pixel_x = geotransform[0] + x * geotransform[1] + y * geotransform[2]
+                pixel_y = geotransform[3] + x * geotransform[4] + y * geotransform[5]
+                world_x, world_y = coordinate_transform(pixel_x, pixel_y)
+                world_x *= scale_factor
+                world_y *= scale_factor
                 world_z = elevation[y, x] * z_scale
                 vertices.append([world_x, world_y, world_z])
                 uvs.append([(x / (cols - 1)) * uv_tile_scale, (y / (rows - 1)) * uv_tile_scale])
@@ -176,6 +256,21 @@ class TerrainGenerator:
         vertices[:, 1] -= center_xy[1]
         vertices[:, 2] -= np.min(vertices[:, 2])
 
+        terrain_metadata = {
+            "source_dem": dem_file.name,
+            "source_crs_wkt": ds.GetSpatialRef().ExportToWkt(),
+            "world_crs_wkt": world_srs.ExportToWkt(),
+            "world_center_xy": [float(center_xy[0]), float(center_xy[1])],
+            "horizontal_scale_factor": float(scale_factor),
+            "source_linear_unit_factor": float(unit_factor),
+            "geotransform": list(geotransform),
+            "width": int(cols),
+            "height": int(rows),
+        }
+        (self.terrain_path / "terrain_metadata.json").write_text(
+            json.dumps(terrain_metadata, sort_keys=True, indent=2) + "\n"
+        )
+
         # Calculate normals
         normals = self._calculate_normals(vertices, faces)
 
@@ -196,7 +291,9 @@ class TerrainGenerator:
             "num_vertices": len(vertices),
             "num_faces": len(faces),
         }
-        logger.info(f"Terrain: X={stats['x_extent']:.2f}, Y={stats['y_extent']:.2f}, Z={stats['z_extent']:.2f}")
+        logger.info(
+            f"Terrain: X={stats['x_extent']:.2f}, Y={stats['y_extent']:.2f}, Z={stats['z_extent']:.2f}"
+        )
         return stl_path, stats
 
     def _calculate_normals(self, vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -215,9 +312,16 @@ class TerrainGenerator:
         normals /= lengths
         return normals
 
-    def _write_obj(self, path: Path, vertices: np.ndarray, uvs: np.ndarray, normals: np.ndarray, faces: np.ndarray) -> None:
+    def _write_obj(
+        self,
+        path: Path,
+        vertices: np.ndarray,
+        uvs: np.ndarray,
+        normals: np.ndarray,
+        faces: np.ndarray,
+    ) -> None:
         """Write OBJ with UVs and normals."""
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             f.write("# Terrain mesh - Forest3D\n")
             for v in vertices:
                 f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
@@ -226,7 +330,9 @@ class TerrainGenerator:
             for n in normals:
                 f.write(f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
             for face in faces:
-                f.write(f"f {face[0]+1}/{face[0]+1}/{face[0]+1} {face[1]+1}/{face[1]+1}/{face[1]+1} {face[2]+1}/{face[2]+1}/{face[2]+1}\n")
+                f.write(
+                    f"f {face[0]+1}/{face[0]+1}/{face[0]+1} {face[1]+1}/{face[1]+1}/{face[1]+1} {face[2]+1}/{face[2]+1}/{face[2]+1}\n"
+                )
 
     def _write_stl(self, path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
         """Write STL for collision and height sampling."""
@@ -243,7 +349,7 @@ class TerrainGenerator:
         if textures:
             for t in textures:
                 tl = t.lower()
-                if t.endswith('.exr'):
+                if t.endswith(".exr"):
                     continue
                 if any(k in tl for k in ["diff", "albedo", "base", "color"]):
                     albedo_map = t
@@ -253,36 +359,36 @@ class TerrainGenerator:
                     roughness_map = t
             if not albedo_map:
                 for t in textures:
-                    if not t.endswith('.exr'):
+                    if not t.endswith(".exr"):
                         albedo_map = t
                         break
 
         if albedo_map:
-            pbr = f'''                <material>
+            pbr = f"""                <material>
                     <ambient>1.0 1.0 1.0 1</ambient>
                     <diffuse>1.0 1.0 1.0 1</diffuse>
                     <specular>0.1 0.1 0.1 1</specular>
                     <pbr>
                         <metal>
-                            <albedo_map>model://ground/texture/{albedo_map}</albedo_map>'''
+                            <albedo_map>model://ground/texture/{albedo_map}</albedo_map>"""
             if normal_map:
-                pbr += f'''
-                            <normal_map>model://ground/texture/{normal_map}</normal_map>'''
+                pbr += f"""
+                            <normal_map>model://ground/texture/{normal_map}</normal_map>"""
             if roughness_map:
-                pbr += f'''
-                            <roughness_map>model://ground/texture/{roughness_map}</roughness_map>'''
-            pbr += '''
+                pbr += f"""
+                            <roughness_map>model://ground/texture/{roughness_map}</roughness_map>"""
+            pbr += """
                             <metalness>0.0</metalness>
                         </metal>
                     </pbr>
-                </material>'''
+                </material>"""
         else:
-            pbr = '''                <material>
+            pbr = """                <material>
                     <ambient>0.6 0.6 0.6 1</ambient>
                     <diffuse>0.8 0.8 0.8 1</diffuse>
-                </material>'''
+                </material>"""
 
-        sdf = f'''<?xml version="1.0" ?>
+        sdf = f"""<?xml version="1.0" ?>
 <sdf version="1.8">
     <model name="terrain">
         <static>true</static>
@@ -304,13 +410,13 @@ class TerrainGenerator:
             </visual>
         </link>
     </model>
-</sdf>'''
+</sdf>"""
         sdf_path = self.terrain_path / "model.sdf"
         sdf_path.write_text(sdf)
         return sdf_path
 
     def _create_config_file(self) -> Path:
-        content = '''<?xml version="1.0"?>
+        content = """<?xml version="1.0"?>
 <model>
     <name>ground</name>
     <version>1.0</version>
@@ -320,13 +426,13 @@ class TerrainGenerator:
         <email>khalid.bourr@gmail.com</email>
     </author>
     <description>Terrain from DEM with PBR materials</description>
-</model>'''
+</model>"""
         path = self.terrain_path / "model.config"
         path.write_text(content)
         return path
 
     def _create_test_world(self) -> Path:
-        content = '''<?xml version="1.0" ?>
+        content = """<?xml version="1.0" ?>
 <sdf version="1.8">
     <world name="terrain_test">
         <scene>
@@ -353,7 +459,7 @@ class TerrainGenerator:
             <uri>model://ground</uri>
         </include>
     </world>
-</sdf>'''
+</sdf>"""
         path = self.terrain_path / "test.world"
         path.write_text(content)
         return path
@@ -367,12 +473,12 @@ class TerrainGenerator:
         return textures
 
     def process_terrain(
-            self,
-            scale_factor: Optional[float] = None,
-            z_scale: Optional[float] = None,
-            smooth_sigma: Optional[float] = None,
-            enhance: Optional[bool] = None,
-            uv_tile_scale: float = 10.0,
+        self,
+        scale_factor: Optional[float] = None,
+        z_scale: Optional[float] = None,
+        smooth_sigma: Optional[float] = None,
+        enhance: Optional[bool] = None,
+        uv_tile_scale: float = 10.0,
     ) -> Path:
         """Full terrain pipeline."""
         logger.info("Starting terrain generation...")
@@ -394,7 +500,7 @@ class TerrainGenerator:
         if not blender_path:
             raise RuntimeError("Blender not found")
 
-        script = f'''
+        script = f"""
 import bpy, os, shutil
 output_dir = "{self.texture_path}"
 bpy.ops.wm.open_mainfile(filepath="{blend_file}")
@@ -414,14 +520,18 @@ for img in bpy.data.images:
         fn = img.name if '.' in img.name else img.name + '.png'
         img.save_render(os.path.join(output_dir, fn))
         print(f"EXPORTED: {{fn}}")
-'''
+"""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
             f.write(script)
             script_path = f.name
 
         try:
-            subprocess.run([str(blender_path), "--background", "--python", script_path],
-                           capture_output=True, text=True, timeout=120)
+            subprocess.run(
+                [str(blender_path), "--background", "--python", script_path],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
         finally:
             os.unlink(script_path)
 

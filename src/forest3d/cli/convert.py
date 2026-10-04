@@ -3,8 +3,9 @@
 import click
 from pathlib import Path
 from rich.progress import Progress, BarColumn, TaskProgressColumn, TextColumn
+from pydantic import ValidationError
 
-from forest3d.config.loader import load_config
+from forest3d.cli.config import load_cli_config, resolve_project_paths
 from forest3d.core.converter import AssetExporter
 
 # Known asset categories
@@ -13,20 +14,34 @@ KNOWN_CATEGORIES = ["tree", "bush", "rock", "grass", "sand"]
 
 @click.command()
 @click.option(
-    "--input", "-i", "input_dir", type=click.Path(exists=True), required=True,
-    help="Directory containing Blender files (or parent with category subfolders)"
+    "--input",
+    "-i",
+    "input_dir",
+    type=click.Path(exists=True),
+    required=True,
+    help="Directory containing Blender files (or parent with category subfolders)",
 )
 @click.option(
-    "--output", "-o", "output_dir", type=click.Path(), required=True,
-    help="Output directory for Gazebo models"
+    "--output",
+    "-o",
+    "output_dir",
+    type=click.Path(),
+    required=True,
+    help="Output directory for Gazebo models",
 )
 @click.option(
-    "--blender", "-b", "blender_path", type=click.Path(exists=True),
-    help="Path to Blender executable (auto-detected if not specified)"
+    "--blender",
+    "-b",
+    "blender_path",
+    type=click.Path(exists=True),
+    help="Path to Blender executable (auto-detected if not specified)",
 )
 @click.option(
-    "--category", "-c", type=click.Choice(KNOWN_CATEGORIES),
-    default=None, help="Model category (auto-detected from folder name if not specified)"
+    "--category",
+    "-c",
+    type=click.Choice(KNOWN_CATEGORIES),
+    default=None,
+    help="Model category (auto-detected from folder name if not specified)",
 )
 @click.pass_context
 def convert(ctx, input_dir, output_dir, blender_path, category):
@@ -56,10 +71,15 @@ def convert(ctx, input_dir, output_dir, blender_path, category):
     """
     console = ctx.obj["console"]
     logger = ctx.obj["logger"]
-    config = load_config(ctx.obj.get("config_path"))
+    config = load_cli_config(ctx.obj.get("config_path"))
+    paths = resolve_project_paths(config)
+    output_dir = Path(output_dir).expanduser().resolve()
 
     if blender_path:
-        config.blender.path = Path(blender_path)
+        try:
+            config.blender.path = Path(blender_path)
+        except ValidationError as exc:
+            raise click.ClickException(f"Invalid Blender configuration:\n{exc}") from exc
 
     input_path = Path(input_dir)
 
@@ -173,4 +193,6 @@ def convert(ctx, input_dir, output_dir, blender_path, category):
 
     if successful > 0:
         console.print(f"\n[dim]To use in Gazebo:[/dim]")
-        console.print(f"  export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:{Path(output_dir).resolve()}")
+        console.print(
+            f"  export GZ_SIM_RESOURCE_PATH=$GZ_SIM_RESOURCE_PATH:{Path(output_dir).resolve()}"
+        )

@@ -40,7 +40,13 @@ def main(ctx, verbose, quiet, config_path):
     Environment Variables:
         FOREST3D_BLENDER_PATH  - Path to Blender executable
         FOREST3D_BASE_PATH     - Project base directory
-        FOREST3D_MODELS_PATH   - Models output directory
+        FOREST3D_MODELS_PATH   - Models directory
+        FOREST3D_WORLDS_PATH   - Worlds output directory
+
+    
+    Path precedence: command options > FOREST3D_* environment > config paths > cwd.
+    Relative configured paths are rooted at the project base; relative CLI paths
+    are rooted at the current working directory.
     """
     ctx.ensure_object(dict)
 
@@ -61,11 +67,13 @@ from forest3d.cli.terrain import terrain
 from forest3d.cli.convert import convert
 from forest3d.cli.generate import generate
 from forest3d.cli.launch import launch
+from forest3d.cli.demo import demo
 
 main.add_command(terrain)
 main.add_command(convert)
 main.add_command(generate)
 main.add_command(launch)
+main.add_command(demo)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,11 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
 from forest3d.config.schema import Forest3DConfig
-
 
 CONFIG_SEARCH_PATHS = [
     Path.cwd() / "forest3d.yaml",
@@ -29,7 +28,7 @@ def find_config_file() -> Optional[Path]:
     return None
 
 
-def load_config(config_path: Optional[Path] = None) -> Forest3DConfig:
+def load_config(config_path: Optional[Path | str] = None) -> Forest3DConfig:
     """Load configuration with cascading defaults.
 
     Priority (highest to lowest):
@@ -44,15 +43,20 @@ def load_config(config_path: Optional[Path] = None) -> Forest3DConfig:
     Returns:
         Validated Forest3DConfig instance.
     """
-    config_dict: dict = {}
+    config_dict: dict[str, Any] = {}
 
     # Load from file if specified or found
     if config_path is None:
         config_path = find_config_file()
+    elif not isinstance(config_path, Path):
+        config_path = Path(config_path)
 
     if config_path and config_path.exists():
         with open(config_path) as f:
-            config_dict = yaml.safe_load(f) or {}
+            loaded = yaml.safe_load(f)
+            if loaded is not None and not isinstance(loaded, dict):
+                raise ValueError(f"Configuration file must contain a YAML mapping: {config_path}")
+            config_dict = loaded or {}
 
     # Environment variable overrides
     if env_blender := os.environ.get("FOREST3D_BLENDER_PATH"):
@@ -63,6 +67,9 @@ def load_config(config_path: Optional[Path] = None) -> Forest3DConfig:
 
     if env_models := os.environ.get("FOREST3D_MODELS_PATH"):
         config_dict.setdefault("paths", {})["models_path"] = env_models
+
+    if env_worlds := os.environ.get("FOREST3D_WORLDS_PATH"):
+        config_dict.setdefault("paths", {})["worlds_path"] = env_worlds
 
     return Forest3DConfig(**config_dict)
 
@@ -76,17 +83,5 @@ def save_config(config: Forest3DConfig, path: Path) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Convert to dict, handling Path objects
-    config_dict = config.model_dump()
-
-    def convert_paths(obj):
-        if isinstance(obj, dict):
-            return {k: convert_paths(v) for k, v in obj.items()}
-        elif isinstance(obj, Path):
-            return str(obj)
-        return obj
-
-    config_dict = convert_paths(config_dict)
-
     with open(path, "w") as f:
-        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+        yaml.safe_dump(config.model_dump(mode="json"), f, default_flow_style=False, sort_keys=False)

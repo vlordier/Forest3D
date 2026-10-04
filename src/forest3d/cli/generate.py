@@ -5,30 +5,26 @@ import click
 from pathlib import Path
 from rich.progress import Progress, BarColumn, TaskProgressColumn, TextColumn
 from rich.table import Table
+from pydantic import ValidationError
 
-from forest3d.config.loader import load_config
+from forest3d.cli.config import load_cli_config, resolve_project_paths
+from forest3d.config.schema import DensityConfig
 from forest3d.core.forest import WorldPopulator
 
 
 @click.command()
 @click.option(
-    "--base-path", "-b", type=click.Path(exists=True),
-    help="Project base path containing models/ directory"
+    "--base-path",
+    "-b",
+    type=click.Path(exists=True),
+    help="Project base path containing models/ directory",
 )
-@click.option(
-    "--density", "-d", type=str,
-    help="JSON density config: '{\"tree\": 50, \"rock\": 5}'"
-)
-@click.option(
-    "--output", "-o", type=click.Path(),
-    help="Output world file path"
-)
-@click.option(
-    "--verbose", "-v", is_flag=True,
-    help="Show detailed statistics including scale info"
-)
+@click.option("--density", "-d", type=str, help='JSON density config: \'{"tree": 50, "rock": 5}\'')
+@click.option("--seed", type=int, help="Seed for reproducible forest placement")
+@click.option("--output", "-o", type=click.Path(), help="Output world file path")
+@click.option("--verbose", "-v", is_flag=True, help="Show detailed statistics including scale info")
 @click.pass_context
-def generate(ctx, base_path, density, output, verbose):
+def generate(ctx, base_path, density, seed, output, verbose):
     """Generate a forest world from existing models.
 
     Procedurally places models on terrain using intelligent positioning
@@ -39,6 +35,7 @@ def generate(ctx, base_path, density, output, verbose):
     Examples:
         forest3d generate
         forest3d generate --density '{"tree": 100, "rock": 20}'
+        forest3d generate --seed 42  # Reproduce placement from this seed
         forest3d generate -b ./my-project -o ./worlds/custom.world
         forest3d generate -v  # Show detailed stats
 
@@ -57,25 +54,35 @@ def generate(ctx, base_path, density, output, verbose):
     """
     console = ctx.obj["console"]
     logger = ctx.obj["logger"]
-    config = load_config(ctx.obj.get("config_path"))
+    config = load_cli_config(ctx.obj.get("config_path"))
 
     # Parse density JSON if provided
+    effective_density = config.density
     if density:
         try:
             density_dict = json.loads(density)
+            if not isinstance(density_dict, dict):
+                raise click.ClickException("Density JSON must be an object of category counts")
+            updates = {}
             for key, value in density_dict.items():
-                if hasattr(config.density, key):
-                    setattr(config.density, key, value)
+                if key in DensityConfig.model_fields:
+                    updates[key] = value
                 else:
                     console.print(f"[yellow]Warning:[/yellow] Unknown category '{key}'")
+            effective_density = DensityConfig.model_validate(
+                {**effective_density.model_dump(), **updates}
+            )
         except json.JSONDecodeError as e:
             raise click.ClickException(f"Invalid JSON for density: {e}")
+        except ValidationError as e:
+            raise click.ClickException(f"Invalid density configuration: {e}")
 
     # Determine base path
-    project_base = Path(base_path) if base_path else Path.cwd()
-    if not (project_base / "models").exists():
+    paths = resolve_project_paths(config, base_path=base_path)
+    project_base = paths.base
+    if not paths.models.exists():
         raise click.ClickException(
-            f"Models directory not found in {project_base}\n\n"
+            f"Models directory not found: {paths.models}\n\n"
             "Make sure you're in a Forest3D project directory with:\n"
             "  - models/ground/  (terrain)\n"
             "  - models/tree/    (trees)\n"
@@ -87,10 +94,9 @@ def generate(ctx, base_path, density, output, verbose):
     table.add_column("Category", style="cyan")
     table.add_column("Count", justify="right")
 
-    density_config = {}
+    density_config = effective_density.model_dump()
     for cat in ["tree", "bush", "rock", "grass", "sand"]:
-        count = getattr(config.density, cat)
-        density_config[cat] = count
+        count = density_config[cat]
         table.add_row(cat, str(count))
 
     console.print(table)
@@ -108,10 +114,10 @@ def generate(ctx, base_path, density, output, verbose):
             )
 
     with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
     ) as progress:
         progress_state["progress"] = progress
         progress_state["task"] = progress.add_task("Generating forest...", total=100)
@@ -120,9 +126,17 @@ def generate(ctx, base_path, density, output, verbose):
             populator = WorldPopulator(
                 base_path=project_base,
                 progress_callback=progress_callback,
+                seed=seed,
+                suitability_config=config.suitability,
+                models_path=paths.models,
+                worlds_path=paths.worlds,
             )
 
-            world_path = populator.create_forest_world(density_config)
+            world_path = populator.create_forest_world(
+                effective_density,
+                output_path=Path(output).resolve() if output else paths.worlds / "forest_world.world",
+                terrain_config=config.terrain,
+            )
 
             # Get statistics
             stats = populator.get_model_statistics()
@@ -156,7 +170,9 @@ def generate(ctx, base_path, density, output, verbose):
         if requested > 0:
             success_rate = f"{(placed / requested * 100):.0f}%"
             color = "green" if placed == requested else "yellow" if placed > 0 else "red"
-            results_table.add_row(cat, str(requested), str(placed), f"[{color}]{success_rate}[/{color}]")
+            results_table.add_row(
+                cat, str(requested), str(placed), f"[{color}]{success_rate}[/{color}]"
+            )
         else:
             results_table.add_row(cat, str(requested), str(placed), "-")
 
@@ -165,7 +181,15 @@ def generate(ctx, base_path, density, output, verbose):
     # Show warning if many placements failed
     failed = total_requested - total_placed
     if failed > 0:
-        console.print(f"\n[yellow]Note:[/yellow] {failed} models couldn't be placed (area too crowded)")
+        console.print(
+            f"\n[yellow]Note:[/yellow] {failed} models couldn't be placed (area too crowded)"
+        )
+
+    ecology_rejections = stats.get("placement_rejections", {})
+    if ecology_rejections:
+        console.print("\n[bold]Ecology suitability rejections[/bold]")
+        for category, reasons in ecology_rejections.items():
+            console.print(f"  {category}: {reasons}")
 
     # Show scale statistics if verbose
     if verbose and stats.get("scale_stats"):
