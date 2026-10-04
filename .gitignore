@@ -42,3 +42,10 @@ models/
 worlds/
 Blender-Assets/*.blend
 Blender-Assets/**/*.blend
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
