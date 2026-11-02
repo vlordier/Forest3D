@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gazebo-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Gazebo Harmonic
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lsb-release wget gnupg
+          sudo wget https://packages.osrfoundation.org/gazebo.gpg -O /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable $(. /etc/os-release && echo $UBUNTU_CODENAME) main" | sudo tee /etc/apt/sources.list.d/gazebo-stable.list
+          sudo apt-get update
+          sudo apt-get install -y gz-harmonic
+      - name: Install project with GDAL support
+        run: uv sync --locked --extra dev --extra terrain --python 3.13
+      - name: Generate demo and start Gazebo headlessly
+        run: bash scripts/gazebo_smoke.sh
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install project and all extras
+        run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
+      - name: Run tests
+        run: uv run --locked --all-extras --python ${{ matrix.python-version }} pytest
